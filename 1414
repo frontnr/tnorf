@@ -1,0 +1,178 @@
+-- Boot → AutoBuy → Success toast → Wait refresh and repeat (client-only)
+
+task.spawn(function()
+    local Players = game:GetService("Players")
+    local RS      = game:GetService("ReplicatedStorage")
+    local RunService = game:GetService("RunService")
+
+    local player  = Players.LocalPlayer
+    if not player.Character then player.CharacterAdded:Wait() end
+    local pg      = player:WaitForChild("PlayerGui")
+
+    local Remote      = RS:WaitForChild("Remote")
+    local FoodStoreRE = Remote:WaitForChild("FoodStoreRE")
+    local CharacterRE = Remote:FindFirstChild("CharacterRE") -- ถ้ามี จะโฟกัสก่อนซื้อ
+
+    -- ===== CONFIG =====
+    local ITEMS = { "Strawberry", "Blueberry", "Watermelon" }
+    -- ของจริงค่อยเปลี่ยนเป็น: { "Pear", "Pineapple", "GoldMango" }
+    local OUT_OF_STOCK = { "No Stock", "ไม่มีสินค้า", "out of stock" }
+
+    local TRG = workspace:WaitForChild("Lobby"):WaitForChild("EventBigPet"):WaitForChild("TrgPart")
+    local TELEPORT_REPEAT, TELEPORT_HOLD = 3, 0.18
+    local BUY_GAP, MAX_TICKS = 0.12, 120
+    local REQUIRE_FOCUS = true
+
+    -- ===== helpers =====
+    local function hasAny(text, words)
+        local s = tostring(text or ""):lower()
+        for _,w in ipairs(words) do if s:find(w:lower(),1,true) then return true end end
+        return false
+    end
+    local function numFromText(t)
+        local n = tostring(t or ""):match("(%d+)")
+        return n and tonumber(n) or 0
+    end
+    local function storeReady()
+        local store = pg:FindFirstChild("ScreenFoodStore")
+        local root  = store and store:FindFirstChild("Root")
+        local frame = root and root:FindFirstChild("Frame")
+        local list  = frame and frame:FindFirstChild("ScrollingFrame")
+        return list ~= nil, store, root, list
+    end
+    local function getWidgets(list, item)
+        local card  = list:FindFirstChild(item); if not card then return end
+        local btn   = card:FindFirstChild("ItemButton")
+        local stock = btn and btn:FindFirstChild("StockLabel")
+        local buttons = card:FindFirstChild("ButtonsFrame")
+        local noBtn   = buttons and buttons:FindFirstChild("NoStockButton")
+        return stock, noBtn
+    end
+    local function isNoStock(stockLabel, noBtn)
+        if noBtn and noBtn:IsA("GuiObject") and noBtn.Visible then return true end
+        return hasAny(stockLabel and stockLabel.Text or "", OUT_OF_STOCK)
+    end
+
+    -- toast เล็ก ๆ บอกสถานะ
+    local function notify(msg)
+        local gui = Instance.new("ScreenGui")
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.Name = "AutoBuyToast"
+        gui.Parent = pg
+        local tl = Instance.new("TextLabel")
+        tl.Size = UDim2.new(0, 320, 0, 46)
+        tl.Position = UDim2.new(0.5, -160, 0.1, 0)
+        tl.BackgroundTransparency = 0.15
+        tl.BackgroundColor3 = Color3.fromRGB(60, 180, 90)
+        tl.TextColor3 = Color3.fromRGB(255,255,255)
+        tl.TextScaled = true
+        tl.Font = Enum.Font.GothamBold
+        tl.Text = msg
+        tl.Parent = gui
+        task.delay(1.2, function() gui:Destroy() end)
+    end
+
+    -- วาร์ปครั้งแรกเพื่อบูตร้าน
+    local function teleportBoot()
+        local char = player.Character or player.CharacterAdded:Wait()
+        local root = char:WaitForChild("HumanoidRootPart")
+        if not char.PrimaryPart then char.PrimaryPart = root end
+        local start = char:GetPivot()
+        for i = 1, TELEPORT_REPEAT do
+            char:PivotTo(TRG.CFrame + Vector3.new(0,3,0))
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+            task.wait(TELEPORT_HOLD)
+            char:PivotTo(start)
+            task.wait(0.12)
+        end
+    end
+
+    -- ซื้อจนหมดสำหรับ 1 รายการ
+    local function drain(item, stockLabel, noBtn)
+        if REQUIRE_FOCUS and CharacterRE then
+            CharacterRE:FireServer("Focus", item); task.wait(0.1)
+        end
+        for t = 1, MAX_TICKS do
+            if isNoStock(stockLabel, noBtn) then break end
+            if numFromText(stockLabel.Text) <= 0 then break end
+            FoodStoreRE:FireServer(item)
+            task.wait(BUY_GAP)
+        end
+    end
+
+    -- ซื้อรอบนึง (ทุกไอเท็มใน ITEMS) แล้วบอก “SUCCESS BUY” ถ้าจบครบ
+    local buying = false
+    local function buyCycle(list)
+        if buying then return end
+        buying = true
+        for _, item in ipairs(ITEMS) do
+            local stock, noBtn = getWidgets(list, item)
+            if stock and (not isNoStock(stock, noBtn)) and numFromText(stock.Text) > 0 then
+                drain(item, stock, noBtn)
+            end
+        end
+        notify("SUCCESS BUY")
+        buying = false
+    end
+
+    -- ===== ขั้นตอนเริ่มต้น: วาร์ปก่อน แล้วเช็กให้ GUI พร้อม =====
+    teleportBoot()
+    task.wait(0.2)
+
+    local ok, store, root, list = storeReady()
+    -- ถ้ายังไม่ขึ้น ลองโฟกัส + รออีกนิด (ไม่วาร์ปซ้ำ)
+    if not ok and CharacterRE and ITEMS[1] then
+        CharacterRE:FireServer("Focus", ITEMS[1]); task.wait(0.25)
+        ok, store, root, list = storeReady()
+    end
+    if not ok then
+        warn("[AutoBuy] ร้านยังไม่ขึ้นใน PlayerGui"); return
+    end
+
+    -- ซื้อรอบแรกทันที (ถ้ามีของ)
+    buyCycle(list)
+
+    -- ===== รอ Refresh แล้วซื้อใหม่ (ไม่วาร์ปอีก) =====
+    -- วิธี 1: ฟัง Title.Text กระโดดกลับไปเป็นนาทีสูง ๆ (เช่น 4–5 นาที) → เพิ่งรีเฟรช
+    local title = root:FindFirstChild("Title")
+    local lastMin = nil
+    local function parseMS(text)
+        local m,s = text:match("(%d+)%s*[mM].-(%d+)%s*[sS]") or text:match("(%d+)%s*[mM]%s*(%d+)%s*[sS]")
+        if m and s then return tonumber(m), tonumber(s) end
+        return nil,nil
+    end
+    if title then
+        title:GetPropertyChangedSignal("Text"):Connect(function()
+            local m = select(1, parseMS(title.Text or ""))
+            if m then
+                if lastMin and m > lastMin then
+                    task.defer(function() buyCycle(list) end) -- พึ่งรีเฟรช
+                end
+                lastMin = m
+            end
+        end)
+    end
+
+    -- วิธี 2: เฝ้า StockLabel ของแต่ละรายการ—ถ้าอยู่ ๆ โผล่ xN ให้ซื้อเลย
+    for _, item in ipairs(ITEMS) do
+        task.spawn(function()
+            local stock, noBtn = getWidgets(list, item)
+            if not stock then return end
+            stock:GetPropertyChangedSignal("Text"):Connect(function()
+                if (not isNoStock(stock, noBtn)) and numFromText(stock.Text) > 0 then
+                    buyCycle(list)
+                end
+            end)
+            -- โพลล์กันพลาด (เผื่อ GUI recreate)
+            RunService.Heartbeat:Connect(function()
+                if (not stock.Parent) then
+                    stock, noBtn = getWidgets(list, item)
+                end
+            end)
+        end)
+    end
+
+    print("[AutoBuy] Ready. Teleport only once; will re-buy after refresh automatically.")
+end)
